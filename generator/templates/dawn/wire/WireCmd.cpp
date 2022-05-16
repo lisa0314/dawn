@@ -11,13 +11,15 @@
 //* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 //* See the License for the specific language governing permissions and
 //* limitations under the License.
-
-#include "dawn/wire/WireCmd_autogen.h"
+{% set namespace_name = Name(metadata.wire_namespace) %}
+{% set wire_dir = namespace_name.Dirs() %}
+{% set wire_namespace = namespace_name.namespace_case() %}
+#include "{{wire_dir}}/WireCmd_autogen.h"
 
 #include "dawn/common/Assert.h"
 #include "dawn/common/Log.h"
-#include "dawn/wire/BufferConsumer_impl.h"
-#include "dawn/wire/Wire.h"
+#include "{{wire_dir}}/BufferConsumer_impl.h"
+#include "{{wire_dir}}/Wire.h"
 
 #include <algorithm>
 #include <cstring>
@@ -102,6 +104,7 @@
 //* Methods are very similar to structures that have one member corresponding to each arguments.
 //* This macro takes advantage of the similarity to output [de]serialization code for a record
 //* that is either a structure or a method, with some special cases for each.
+{% set PREFIX = metadata.c_prefix.upper() %}
 {% macro write_record_serialization_helpers(record, name, members, is_cmd=False, is_return_command=False) %}
     {% set Return = "Return" if is_return_command else "" %}
     {% set Cmd = "Cmd" if is_cmd else "" %}
@@ -119,7 +122,7 @@
         {% elif record.extensible %}
             bool hasNextInChain;
         {% elif record.chained %}
-            WGPUChainedStructTransfer chain;
+            {{PREFIX}}ChainedStructTransfer chain;
         {% endif %}
 
         //* Value types are directly in the command, objects being replaced with their IDs.
@@ -291,6 +294,140 @@
     }
     DAWN_UNUSED_FUNC({{Return}}{{name}}Serialize);
 
+    //* Deserializes `transfer` into `record` getting more serialized data from `buffer` and `size`
+    //* if needed, using `allocator` to store pointed-to values and `resolver` to translate object
+    //* Ids to actual objects.
+    DAWN_DECLARE_UNUSED WireResult {{Return}}{{name}}Deserialize(
+        {{Return}}{{name}}{{Cmd}}* record,
+        const volatile {{Return}}{{name}}Transfer* transfer,
+        DeserializeBuffer* deserializeBuffer,
+        DeserializeAllocator* allocator
+        {%- if record.may_have_dawn_object -%}
+            , const ObjectIdResolver& resolver
+        {%- endif -%}
+    ) {
+        DAWN_UNUSED(allocator);
+
+        {% if is_cmd %}
+            ASSERT(transfer->commandId == {{Return}}WireCmd::{{name}});
+        {% endif %}
+
+        {% if record.derived_method %}
+            record->selfId = transfer->self;
+        {% endif %}
+
+        //* Value types are directly in the transfer record, objects being replaced with their IDs.
+        {% for member in members if member.annotation == "value" %}
+            {% set memberName = as_varName(member.name) %}
+            {{deserialize_member(member, "transfer->" + memberName, "record->" + memberName)}}
+        {% endfor %}
+
+        {% if record.extensible %}
+            record->nextInChain = nullptr;
+            if (transfer->hasNextInChain) {
+                WIRE_TRY(DeserializeChainedStruct(&record->nextInChain, deserializeBuffer, allocator, resolver));
+            }
+        {% endif %}
+
+        {% if record.chained %}
+            //* Should be set by the root descriptor's call to DeserializeChainedStruct.
+            //* Don't check |record->chain.next| matches because it is not set until the
+            //* next iteration inside DeserializeChainedStruct.
+            ASSERT(record->chain.sType == {{as_cEnum(types["s type"].name, record.name)}});
+            ASSERT(record->chain.next == nullptr);
+        {% endif %}
+
+        //* Special handling of const char* that have their length embedded directly in the command
+        {% for member in members if member.length == "strlen" %}
+            {% set memberName = as_varName(member.name) %}
+
+            {% if member.optional %}
+                bool has_{{memberName}} = transfer->has_{{memberName}};
+                record->{{memberName}} = nullptr;
+                if (has_{{memberName}})
+            {% endif %}
+            {
+                uint64_t stringLength64 = transfer->{{memberName}}Strlen;
+                if (stringLength64 >= std::numeric_limits<size_t>::max()) {
+                    //* Cannot allocate space for the string. It can be at most
+                    //* size_t::max() - 1. We need 1 byte for the null-terminator.
+                    return WireResult::FatalError;
+                }
+                size_t stringLength = static_cast<size_t>(stringLength64);
+
+                const volatile char* stringInBuffer;
+                WIRE_TRY(deserializeBuffer->ReadN(stringLength, &stringInBuffer));
+
+                char* copiedString;
+                WIRE_TRY(GetSpace(allocator, stringLength + 1, &copiedString));
+                //* We can cast away the volatile qualifier because DeserializeBuffer::ReadN already
+                //* validated that the range [stringInBuffer, stringInBuffer + stringLength) is valid.
+                //* memcpy may have an unknown access pattern, but this is fine since the string is only
+                //* data and won't affect control flow of this function.
+                memcpy(copiedString, const_cast<const char*>(stringInBuffer), stringLength);
+                copiedString[stringLength] = '\0';
+                record->{{memberName}} = copiedString;
+            }
+        {% endfor %}
+
+        //* Get extra buffer data, and copy pointed to values in extra allocated space.
+        {% for member in members if member.annotation != "value" and member.length != "strlen" %}
+            {{ assert(member.annotation != "const*const*") }}
+            {% set memberName = as_varName(member.name) %}
+
+            {% if member.type.category != "object" and member.optional %}
+                //* Non-constant length optional members use length=0 to denote they aren't present.
+                //* Otherwise we could have length=N and has_member=false, causing reads from an
+                //* uninitialized pointer.
+                {{ assert(member.length == "constant") }}
+                bool has_{{memberName}} = transfer->has_{{memberName}};
+                record->{{memberName}} = nullptr;
+                if (has_{{memberName}})
+            {% endif %}
+            {
+                auto memberLength = {{member_length(member, "record->")}};
+                const volatile {{member_transfer_type(member)}}* memberBuffer;
+                WIRE_TRY(deserializeBuffer->ReadN(memberLength, &memberBuffer));
+
+                //* For data-only members (e.g. "data" in WriteBuffer and WriteTexture), they are
+                //* not security sensitive so we can directly refer the data inside the transfer
+                //* buffer in dawn_native. For other members, as prevention of TOCTOU attacks is an
+                //* important feature of the wire, we must make sure every single value returned to
+                //* dawn_native must be a copy of what's in the wire.
+                {% if member.json_data["wire_is_data_only"] %}
+                    record->{{memberName}} =
+                        const_cast<const {{member_transfer_type(member)}}*>(memberBuffer);
+
+                {% else %}
+                    {{as_cType(member.type.name)}}* copiedMembers;
+                    WIRE_TRY(GetSpace(allocator, memberLength, &copiedMembers));
+                    record->{{memberName}} = copiedMembers;
+
+                    {% if member.type.is_wire_transparent %}
+                        //* memcpy is not allowed to copy from volatile objects. However, these
+                        //* arrays are just used as plain data, and don't impact control flow. So if
+                        //* the underlying data were changed while the copy was still executing, we
+                        //* would get different data - but it wouldn't cause unexpected downstream
+                        //* effects.
+                        memcpy(
+                            copiedMembers,
+                            const_cast<const {{member_transfer_type(member)}}*>(memberBuffer),
+                           {{member_transfer_sizeof(member)}} * memberLength);
+                    {% else %}
+                        //* This loop cannot overflow because it iterates up to |memberLength|. Even
+                        //* if memberLength were the maximum integer value, |i| would become equal
+                        //* to it just before exiting the loop, but not increment past or wrap
+                        //* around.
+                        for (decltype(memberLength) i = 0; i < memberLength; ++i) {
+                            {{deserialize_member(member, "memberBuffer[i]", "copiedMembers[i]")}}
+                        }
+                    {% endif %}
+                {% endif %}
+            }
+        {% endfor %}
+
+        return WireResult::Success;
+    }
     DAWN_UNUSED_FUNC({{Return}}{{name}}Deserialize);
 {% endmacro %}
 
@@ -364,8 +501,8 @@
 {% endmacro %}
 
 {% macro make_chained_struct_serialization_helpers(out=None) %}
-        {% set ChainedStructPtr = "WGPUChainedStructOut*" if out else "const WGPUChainedStruct*" %}
-        {% set ChainedStruct = "WGPUChainedStructOut" if out else "WGPUChainedStruct" %}
+        {% set ChainedStructPtr = PREFIX~"ChainedStructOut*" if out else "const "~PREFIX~"ChainedStruct*" %}
+        {% set ChainedStruct = PREFIX~"ChainedStructOut" if out else PREFIX~"ChainedStruct" %}
         size_t GetChainedStructExtraRequiredSize({{ChainedStructPtr}} chainedStruct) {
             ASSERT(chainedStruct != nullptr);
             size_t result = 0;
@@ -385,10 +522,10 @@
                         }
                     {% endfor %}
                     // Explicitly list the Invalid enum. MSVC complains about no case labels.
-                    case WGPUSType_Invalid:
+                    case {{PREFIX}}SType_Invalid:
                     default:
                         // Invalid enum. Reserve space just for the transfer header (sType and hasNext).
-                        result += sizeof(WGPUChainedStructTransfer);
+                        result += sizeof({{PREFIX}}ChainedStructTransfer);
                         chainedStruct = chainedStruct->next;
                         break;
                 }
@@ -426,17 +563,17 @@
                         } break;
                     {% endfor %}
                     // Explicitly list the Invalid enum. MSVC complains about no case labels.
-                    case WGPUSType_Invalid:
+                    case {{PREFIX}}SType_Invalid:
                     default: {
                         // Invalid enum. Serialize just the transfer header with Invalid as the sType.
                         // TODO(crbug.com/dawn/369): Unknown sTypes are silently discarded.
-                        if (chainedStruct->sType != WGPUSType_Invalid) {
+                        if (chainedStruct->sType != {{PREFIX}}SType_Invalid) {
                             dawn::WarningLog() << "Unknown sType " << chainedStruct->sType << " discarded.";
                         }
 
-                        WGPUChainedStructTransfer* transfer;
+                        {{PREFIX}}ChainedStructTransfer* transfer;
                         WIRE_TRY(buffer->Next(&transfer));
-                        transfer->sType = WGPUSType_Invalid;
+                        transfer->sType = {{PREFIX}}SType_Invalid;
                         transfer->hasNext = chainedStruct->next != nullptr;
 
                         // Still move on in case there are valid structs after this.
@@ -454,9 +591,9 @@
                                             const ObjectIdResolver& resolver) {
             bool hasNext;
             do {
-                const volatile WGPUChainedStructTransfer* header;
+                const volatile {{PREFIX}}ChainedStructTransfer* header;
                 WIRE_TRY(deserializeBuffer->Peek(&header));
-                WGPUSType sType = header->sType;
+                {{PREFIX}}SType sType = header->sType;
                 switch (sType) {
                     {% for sType in types["s type"].values if (
                             sType.valid and
@@ -486,20 +623,20 @@
                         } break;
                     {% endfor %}
                     // Explicitly list the Invalid enum. MSVC complains about no case labels.
-                    case WGPUSType_Invalid:
+                    case {{PREFIX}}SType_Invalid:
                     default: {
                         // Invalid enum. Deserialize just the transfer header with Invalid as the sType.
                         // TODO(crbug.com/dawn/369): Unknown sTypes are silently discarded.
-                        if (sType != WGPUSType_Invalid) {
+                        if (sType != {{PREFIX}}SType_Invalid) {
                             dawn::WarningLog() << "Unknown sType " << sType << " discarded.";
                         }
 
-                        const volatile WGPUChainedStructTransfer* transfer;
+                        const volatile {{PREFIX}}ChainedStructTransfer* transfer;
                         WIRE_TRY(deserializeBuffer->Read(&transfer));
 
                         {{ChainedStruct}}* outStruct;
                         WIRE_TRY(GetSpace(allocator, sizeof({{ChainedStruct}}), &outStruct));
-                        outStruct->sType = WGPUSType_Invalid;
+                        outStruct->sType = {{PREFIX}}SType_Invalid;
                         outStruct->next = nullptr;
 
                         // Still move on in case there are valid structs after this.
@@ -515,3 +652,139 @@
         }
 {% endmacro %}
 
+namespace {{wire_namespace}} {
+
+    ObjectHandle::ObjectHandle() = default;
+    ObjectHandle::ObjectHandle(ObjectId id, ObjectGeneration generation)
+        : id(id), generation(generation) {
+    }
+
+    ObjectHandle::ObjectHandle(const volatile ObjectHandle& rhs)
+        : id(rhs.id), generation(rhs.generation) {
+    }
+    ObjectHandle& ObjectHandle::operator=(const volatile ObjectHandle& rhs) {
+        id = rhs.id;
+        generation = rhs.generation;
+        return *this;
+    }
+
+    ObjectHandle& ObjectHandle::AssignFrom(const ObjectHandle& rhs) {
+        id = rhs.id;
+        generation = rhs.generation;
+        return *this;
+    }
+    ObjectHandle& ObjectHandle::AssignFrom(const volatile ObjectHandle& rhs) {
+        id = rhs.id;
+        generation = rhs.generation;
+        return *this;
+    }
+
+    namespace {
+        // Allocates enough space from allocator to countain T[count] and return it in out.
+        // Return FatalError if the allocator couldn't allocate the memory.
+        // Always writes to |out| on success.
+        template <typename T, typename N>
+        WireResult GetSpace(DeserializeAllocator* allocator, N count, T** out) {
+            constexpr size_t kMaxCountWithoutOverflows = std::numeric_limits<size_t>::max() / sizeof(T);
+            if (count > kMaxCountWithoutOverflows) {
+                return WireResult::FatalError;
+            }
+
+            size_t totalSize = sizeof(T) * count;
+            *out = static_cast<T*>(allocator->GetSpace(totalSize));
+            if (*out == nullptr) {
+                return WireResult::FatalError;
+            }
+
+            return WireResult::Success;
+        }
+
+        struct {{PREFIX}}ChainedStructTransfer {
+            {{PREFIX}}SType sType;
+            bool hasNext;
+        };
+
+        size_t GetChainedStructExtraRequiredSize(const {{PREFIX}}ChainedStruct* chainedStruct);
+        [[nodiscard]] WireResult SerializeChainedStruct(const {{PREFIX}}ChainedStruct* chainedStruct,
+                                                          SerializeBuffer* buffer,
+                                                          const ObjectIdProvider& provider);
+        WireResult DeserializeChainedStruct(const {{PREFIX}}ChainedStruct** outChainNext,
+                                            DeserializeBuffer* deserializeBuffer,
+                                            DeserializeAllocator* allocator,
+                                            const ObjectIdResolver& resolver);
+
+        size_t GetChainedStructExtraRequiredSize({{PREFIX}}ChainedStructOut* chainedStruct);
+        [[nodiscard]] WireResult SerializeChainedStruct({{PREFIX}}ChainedStructOut* chainedStruct,
+                                                          SerializeBuffer* buffer,
+                                                          const ObjectIdProvider& provider);
+        WireResult DeserializeChainedStruct({{PREFIX}}ChainedStructOut** outChainNext,
+                                            DeserializeBuffer* deserializeBuffer,
+                                            DeserializeAllocator* allocator,
+                                            const ObjectIdResolver& resolver);
+
+        //* Output structure [de]serialization first because it is used by commands.
+        {% for type in by_category["structure"] %}
+            {% set name = as_cType(type.name) %}
+            {% if type.name.CamelCase() not in client_side_structures %}
+                {{write_record_serialization_helpers(type, name, type.members, is_cmd=False)}}
+            {% endif %}
+        {% endfor %}
+
+
+        {{ make_chained_struct_serialization_helpers(out=False) }}
+        {{ make_chained_struct_serialization_helpers(out=True) }}
+
+        //* Output [de]serialization helpers for commands
+        {% for command in cmd_records["command"] %}
+            {% set name = command.name.CamelCase() %}
+            {{write_record_serialization_helpers(command, name, command.members, is_cmd=True)}}
+        {% endfor %}
+
+        //* Output [de]serialization helpers for return commands
+        {% for command in cmd_records["return command"] %}
+            {% set name = command.name.CamelCase() %}
+            {{write_record_serialization_helpers(command, name, command.members,
+                                                 is_cmd=True, is_return_command=True)}}
+        {% endfor %}
+
+        // Implementation of ObjectIdResolver that always errors.
+        // Used when the generator adds a provider argument because of a chained
+        // struct, but in practice, a chained struct in that location is invalid.
+        class ErrorObjectIdResolver final : public ObjectIdResolver {
+            public:
+                {% for type in by_category["object"] %}
+                    WireResult GetFromId(ObjectId id, {{as_cType(type.name)}}* out) const override {
+                        return WireResult::FatalError;
+                    }
+                    WireResult GetOptionalFromId(ObjectId id, {{as_cType(type.name)}}* out) const override {
+                        return WireResult::FatalError;
+                    }
+                {% endfor %}
+        };
+
+        // Implementation of ObjectIdProvider that always errors.
+        // Used when the generator adds a provider argument because of a chained
+        // struct, but in practice, a chained struct in that location is invalid.
+        class ErrorObjectIdProvider final : public ObjectIdProvider {
+            public:
+                {% for type in by_category["object"] %}
+                    WireResult GetId({{as_cType(type.name)}} object, ObjectId* out) const override {
+                        return WireResult::FatalError;
+                    }
+                    WireResult GetOptionalId({{as_cType(type.name)}} object, ObjectId* out) const override {
+                        return WireResult::FatalError;
+                    }
+                {% endfor %}
+        };
+
+    }  // anonymous namespace
+
+    {% for command in cmd_records["command"] %}
+        {{ write_command_serialization_methods(command, False) }}
+    {% endfor %}
+
+    {% for command in cmd_records["return command"] %}
+        {{ write_command_serialization_methods(command, True) }}
+    {% endfor %}
+
+}  // namespace {{wire_namespace}}

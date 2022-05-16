@@ -11,18 +11,22 @@
 //* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 //* See the License for the specific language governing permissions and
 //* limitations under the License.
+{% set namespace_name = Name(metadata.wire_namespace) %}
+{% set DIR = namespace_name.concatcase().upper() %}
+#ifndef {{DIR}}_SERVER_SERVERBASE_H_
+#define {{DIR}}_SERVER_SERVERBASE_H_
 
-#ifndef DAWNWIRE_SERVER_SERVERBASE_H_
-#define DAWNWIRE_SERVER_SERVERBASE_H_
+{% set api = metadata.api.lower() %}
+#include "dawn/{{api}}_proc_table.h"
+{% set wire_dir = namespace_name.Dirs() %}
+{% set wire_namespace = namespace_name.namespace_case() %}
+#include "{{wire_dir}}/ChunkedCommandHandler.h"
+#include "{{wire_dir}}/Wire.h"
+#include "{{wire_dir}}/WireCmd_autogen.h"
+#include "{{wire_dir}}/WireDeserializeAllocator.h"
+#include "{{wire_dir}}/server/ObjectStorage.h"
 
-#include "dawn/dawn_proc_table.h"
-#include "dawn/wire/ChunkedCommandHandler.h"
-#include "dawn/wire/Wire.h"
-#include "dawn/wire/WireCmd_autogen.h"
-#include "dawn/wire/WireDeserializeAllocator.h"
-#include "dawn/wire/server/ObjectStorage.h"
-
-namespace dawn::wire::server {
+namespace {{wire_namespace}}::server {
 
     class ServerBase : public ChunkedCommandHandler, public ObjectIdResolver {
       public:
@@ -30,9 +34,10 @@ namespace dawn::wire::server {
         virtual ~ServerBase() = default;
 
       protected:
-        void DestroyAllObjects(const DawnProcTable& procs) {
+        {% set prefix = metadata.proc_table_prefix %}
+        void DestroyAllObjects(const {{prefix}}ProcTable& procs) {
             //* Free all objects when the server is destroyed
-            {% for type in by_category["object"] if type.name.get() != "device" %}
+            {% for type in by_category["object"] if type.name.get() != "context" %}
                 {
                     std::vector<{{as_cType(type.name)}}> handles = mKnown{{type.name.CamelCase()}}.AcquireAllHandles();
                     for ({{as_cType(type.name)}} handle : handles) {
@@ -42,9 +47,14 @@ namespace dawn::wire::server {
             {% endfor %}
             //* Release devices last because dawn_native requires this.
             {
-                std::vector<WGPUDevice> handles = mKnownDevice.AcquireAllHandles();
-                for (WGPUDevice handle : handles) {
-                    procs.deviceRelease(handle);
+                //* std::vector<WGPUDevice> handles = mKnownDevice.AcquireAllHandles();
+                //* for (WGPUDevice handle : handles) {
+                    //* procs.deviceRelease(handle);
+                //* }
+
+                std::vector<WNNContext> handles = mKnownContext.AcquireAllHandles();
+                for (WNNContext handle : handles) {
+                    procs.contextRelease(handle);
                 }
             }
         }
@@ -100,6 +110,6 @@ namespace dawn::wire::server {
         {% endfor %}
     };
 
-}  // namespace dawn::wire::server
+}  // namespace {{wire_namespace}}::server
 
-#endif  // DAWNWIRE_SERVER_SERVERBASE_H_
+#endif  // {{DIR}}_SERVER_SERVERBASE_H_

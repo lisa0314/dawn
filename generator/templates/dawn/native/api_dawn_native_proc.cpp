@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-{% set dir = metadata.proc_table_prefix.lower() %}
-#include "{{dir}}/{{metadata.api.lower()}}.h"
+#include "dawn/{{metadata.api.lower()}}.h"
 
-namespace dawn::native {
+{% set namespace_name = Name(metadata.native_namespace) %}
+{% set native_namespace = namespace_name.namespace_case() %}
+namespace {{native_namespace}} {
 
 // This file should be kept in sync with generator/templates/dawn/native/ProcTable.cpp
 
@@ -40,7 +41,7 @@ namespace dawn::native {
 }
 
 extern "C" {
-    using namespace dawn::native;
+    using namespace {{native_namespace}};
 
     {% for function in by_category["function"] %}
         {{as_cType(function.return_type.name)}} {{metadata.namespace}}{{as_cppType(function.name)}} (
